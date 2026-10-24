@@ -2,171 +2,194 @@
 """
 xr_button_bridge_node.py
 
-Receive XR-controller state from teleop_hand_and_arm_*.py over UDP and
-republish it as ROS 2 topics inside this container.
+Receive ALL XR controller inputs (buttons, triggers, grips, thumbsticks) from
+teleop_hand_and_arm_button.py over UDP and republish them as ROS 2 topics.
+Topic names and parameters are configured in a YAML file
+(default: xr_button_bridge.yaml next to this script, override with --config).
 
-Payload formats (little-endian, both accepted on the same port):
-    2  bytes '<??'     : (right_ctrl_bButton [B],
-                          left_ctrl_bButton  [Y])
-    14 bytes '<fff??'  : (vx, vy, vyaw,
-                          right_ctrl_bButton [B],
-                          left_ctrl_bButton  [Y])
+Payload (little-endian, 42 bytes total): '<10?8f'
+    bools  (10): L_trigger, L_squeeze, L_X, L_Y, L_thumbstick,
+                 R_trigger, R_squeeze, R_A, R_B, R_thumbstick
+    floats  (8): L_trigger(0..1), L_squeeze(0..1), L_stick_x, L_stick_y,
+                 R_trigger(0..1), R_squeeze(0..1), R_stick_x, R_stick_y
 
-Published topics:
-    /teleop/button/right_b   std_msgs/Bool     edge-triggered (existing)
-    /teleop/button/left_y    std_msgs/Bool     edge-triggered (existing)
-    /teleop/cmd_vel          geometry_msgs/Twist  latest stick value (new)
-    /teleop/damp             std_msgs/Bool     True while both sticks pressed (new)
+Trigger on/off is NOT taken from the packet's bool; it is derived from the
+analog trigger value with trigger.threshold (default 0.5) and optional hysteresis.
 
-`/teleop/cmd_vel` is republished at a fixed rate (default 50 Hz) using the
-most recent UDP sample, so the walking controller sees a steady stream even
-if UDP packets are dropped. When no packet has arrived for --cmd-vel-timeout
-seconds, zero velocity is published instead.
+Published topics (names from YAML):
+    buttons.*  std_msgs/Bool     edge-triggered (True once on press, False once on release)
+    values.*   std_msgs/Float32  continuous at publish_hz
+    joy.topic  sensor_msgs/Joy   continuous at publish_hz
+If no packet arrives for `timeout` seconds, all inputs are released / zeroed.
 """
 
 import argparse
+import os
 import socket
 import struct
 import sys
 import time
 
+import yaml
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from std_msgs.msg import Bool
-from geometry_msgs.msg import Twist
+from std_msgs.msg import Bool, Float32
+from sensor_msgs.msg import Joy
 
 
-FMT_BTN     = '<??'      # 2 bytes  : B, Y
-SIZE_BTN    = struct.calcsize(FMT_BTN)
-FMT_FULL    = '<fff??'   # 14 bytes : vx, vy, vyaw, B, Y
-SIZE_FULL   = struct.calcsize(FMT_FULL)
+FMT = '<10?8f'
+SIZE = struct.calcsize(FMT)
+
+# order == bool block of the payload == Joy.buttons
+BUTTON_KEYS = [
+    'left_trigger', 'left_squeeze', 'left_x', 'left_y', 'left_thumbstick',
+    'right_trigger', 'right_squeeze', 'right_a', 'right_b', 'right_thumbstick',
+]
+# order == float block of the payload == Joy.axes
+VALUE_KEYS = [
+    'left_trigger', 'left_squeeze', 'left_stick_x', 'left_stick_y',
+    'right_trigger', 'right_squeeze', 'right_stick_x', 'right_stick_y',
+]
+# button index -> value index used for threshold-based on/off
+TRIGGER_MAP = {BUTTON_KEYS.index('left_trigger'):  VALUE_KEYS.index('left_trigger'),
+               BUTTON_KEYS.index('right_trigger'): VALUE_KEYS.index('right_trigger')}
+
+DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'xr_button_bridge.yaml')
+
+
+def _topics(entry):
+    """YAML entry -> list of topic names (str / list / null)."""
+    if entry is None:
+        return []
+    if isinstance(entry, str):
+        return [entry] if entry.strip() else []
+    if isinstance(entry, (list, tuple)):
+        return [t for t in entry if isinstance(t, str) and t.strip()]
+    raise ValueError(f'invalid topic entry: {entry!r}')
+
+
+def load_config(path):
+    with open(path, 'r') as f:
+        cfg = yaml.safe_load(f) or {}
+    for sect, keys in (('buttons', BUTTON_KEYS), ('values', VALUE_KEYS)):
+        unknown = set((cfg.get(sect) or {}).keys()) - set(keys)
+        if unknown:
+            raise ValueError(f'unknown key(s) in "{sect}": {sorted(unknown)} (valid: {keys})')
+    return cfg
 
 
 class XrButtonBridge(Node):
-    def __init__(self, host, port,
-                 cmd_vel_topic, cmd_vel_rate, cmd_vel_timeout,
-                 cmd_vel_deadzone,
-                 damp_hold_topic, qos_depth):
+    def __init__(self, cfg, host=None, port=None):
         super().__init__('xr_button_bridge')
 
-        # ---- publishers ----
-        # buttons: keep the existing behavior (edge-triggered, reliable)
-        self.pub_right_b = self.create_publisher(Bool, '/right_button', qos_depth)
-        self.pub_left_y  = self.create_publisher(Bool, '/left_button',  qos_depth)
+        udp = cfg.get('udp') or {}
+        host = host if host is not None else udp.get('host', '0.0.0.0')
+        port = port if port is not None else int(udp.get('port', 9870))
+        qos = int(cfg.get('qos_depth', 10))
+        publish_hz = float(cfg.get('publish_hz', 30.0))
+        self.timeout = float(cfg.get('timeout', 0.5))
+        trig = cfg.get('trigger') or {}
+        self.trig_on = float(trig.get('threshold', 0.5))
+        self.trig_off = self.trig_on - float(trig.get('hysteresis', 0.0))
 
-        # cmd_vel: best-effort, small depth — a walking controller wants the
-        # latest sample, not a backlog.
-        cmd_qos = QoSProfile(depth=10,
-                             reliability=ReliabilityPolicy.RELIABLE,
-                             history=HistoryPolicy.KEEP_LAST)
-        self.pub_cmd_vel = self.create_publisher(Twist, cmd_vel_topic, cmd_qos)
-        self.pub_damp    = self.create_publisher(Bool,  damp_hold_topic, qos_depth)
+        btn_cfg = cfg.get('buttons') or {}
+        val_cfg = cfg.get('values') or {}
+        joy_cfg = cfg.get('joy') or {}
 
-        # ---- UDP socket ----
+        # button index -> list of publishers
+        self.pub_buttons = [[self.create_publisher(Bool, t, qos) for t in _topics(btn_cfg.get(k))]
+                            for k in BUTTON_KEYS]
+        self.pub_values = [[self.create_publisher(Float32, t, qos) for t in _topics(val_cfg.get(k))]
+                           for k in VALUE_KEYS]
+        joy_topics = _topics(joy_cfg.get('topic', '/xr/joy'))
+        self.pub_joy = [self.create_publisher(Joy, t, qos) for t in joy_topics]
+        self.joy_frame = str(joy_cfg.get('frame_id', 'xr_controller'))
+
+        for k, pubs in zip(BUTTON_KEYS, self.pub_buttons):
+            self.get_logger().info(f'button {k:17s} -> {[p.topic_name for p in pubs] or "(disabled)"}')
+        for k, pubs in zip(VALUE_KEYS, self.pub_values):
+            self.get_logger().info(f'value  {k:17s} -> {[p.topic_name for p in pubs] or "(disabled)"}')
+        self.get_logger().info(f'joy                      -> {joy_topics or "(disabled)"}')
+
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((host, port))
         self.sock.setblocking(False)
         self.get_logger().info(
-            f'UDP listening on {host}:{port} '
-            f'(accepts {SIZE_BTN}B [buttons] or {SIZE_FULL}B [stick+buttons])'
-        )
-        self.get_logger().info(
-            f'publishing: {cmd_vel_topic} @ {cmd_vel_rate:.0f} Hz, '
-            f'{damp_hold_topic}, /right_button, /left_button'
+            f'listening on UDP {host}:{port} (fmt={FMT}, size={SIZE}), '
+            f'trigger on>={self.trig_on:.2f} off<{self.trig_off:.2f}, '
+            f'{publish_hz:.1f} Hz, timeout {self.timeout:.2f}s'
         )
 
-        # ---- state ----
-        self._prev_right_b = False
-        self._prev_left_y  = False
-        self._prev_damp    = False
-        self._last_vx = 0.0
-        self._last_vy = 0.0
-        self._last_vyaw = 0.0
-        self._last_rx_time = 0.0     # monotonic seconds; 0 = never
-        self._cmd_vel_timeout = float(cmd_vel_timeout)
-        self._cmd_vel_deadzone = float(cmd_vel_deadzone)
-        self._was_moving = False
+        self._buttons = [False] * len(BUTTON_KEYS)
+        self._values = [0.0] * len(VALUE_KEYS)
+        self._last_rx = None
+        self._stale = True
 
-        # ---- timers ----
-        self.create_timer(0.005, self._poll_udp)                     # 200 Hz recv
-        self.create_timer(1.0 / cmd_vel_rate, self._publish_cmd_vel)  # steady rate
+        self.create_timer(0.005, self._poll)                # 200 Hz UDP drain + edges
+        self.create_timer(1.0 / publish_hz, self._publish)  # continuous stream
 
-    # ------------------------------------------------------------------ #
-    #  UDP intake                                                        #
-    # ------------------------------------------------------------------ #
-    def _poll_udp(self):
+    def _poll(self):
         latest = None
         while True:
             try:
-                data, _ = self.sock.recvfrom(64)
+                data, _ = self.sock.recvfrom(128)
             except BlockingIOError:
                 break
             except Exception as e:
                 self.get_logger().warn(f'recvfrom failed: {e}')
                 break
-            if len(data) not in (SIZE_BTN, SIZE_FULL):
+            if len(data) != SIZE:
                 self.get_logger().warn(
-                    f'ignoring packet of unexpected size {len(data)} '
-                    f'(expected {SIZE_BTN} or {SIZE_FULL})')
+                    f'ignoring packet of unexpected size {len(data)} (expected {SIZE})',
+                    throttle_duration_sec=2.0)
                 continue
             latest = data
 
-        if latest is None:
-            return
-
-        if len(latest) == SIZE_FULL:
-            vx, vy, vyaw, right_b, left_y = struct.unpack(FMT_FULL, latest)
-            self._last_vx, self._last_vy, self._last_vyaw = float(vx), float(vy), float(vyaw)
-            self._last_rx_time = time.monotonic()
-        else:  # SIZE_BTN
-            right_b, left_y = struct.unpack(FMT_BTN, latest)
-
-        right_b = bool(right_b)
-        left_y  = bool(left_y)
-
-        # ---- buttons: edge-triggered publish (unchanged behavior) ----
-        if right_b != self._prev_right_b:
-            self.pub_right_b.publish(Bool(data=right_b))
-            self.get_logger().info(f'B {"pressed" if right_b else "released"}')
-            self._prev_right_b = right_b
-
-        if left_y != self._prev_left_y:
-            self.pub_left_y.publish(Bool(data=left_y))
-            self.get_logger().info(f'Y {"pressed" if left_y else "released"}')
-            self._prev_left_y = left_y
-
-    # ------------------------------------------------------------------ #
-    #  Steady cmd_vel republish                                          #
-    # ------------------------------------------------------------------ #
-    def _publish_cmd_vel(self):
-        # Publish only while the stick is actually deflected (beyond the deadzone).
-        # On the transition to rest (or on UDP timeout), publish ONE zero Twist so
-        # the walking controller stops, then stay silent until the stick moves again.
         now = time.monotonic()
-        stale = (self._last_rx_time == 0.0) or \
-                (now - self._last_rx_time > self._cmd_vel_timeout)
+        if latest is not None:
+            raw = struct.unpack(FMT, latest)
+            buttons = [bool(v) for v in raw[:10]]
+            values = [float(v) for v in raw[10:]]
+            # trigger on/off from analog value with threshold (+ hysteresis)
+            for bi, vi in TRIGGER_MAP.items():
+                thr = self.trig_off if self._buttons[bi] else self.trig_on
+                buttons[bi] = values[vi] >= thr
+            self._update(buttons, values)
+            self._last_rx = now
+            if self._stale:
+                self.get_logger().info('receiving controller data')
+                self._stale = False
+        elif not self._stale and self._last_rx is not None and now - self._last_rx > self.timeout:
+            self.get_logger().warn(f'no packet for {self.timeout:.2f}s -> releasing all inputs')
+            self._update([False] * len(BUTTON_KEYS), [0.0] * len(VALUE_KEYS))
+            self._stale = True
 
-        dz = self._cmd_vel_deadzone
-        moving = (not stale) and (
-            abs(self._last_vx)   > dz or
-            abs(self._last_vy)   > dz or
-            abs(self._last_vyaw) > dz
-        )
+    def _update(self, buttons, values):
+        # edge detection: publish only when a button state changes
+        for i, (new, old) in enumerate(zip(buttons, self._buttons)):
+            if new != old:
+                msg = Bool(data=new)
+                for pub in self.pub_buttons[i]:
+                    pub.publish(msg)
+                self.get_logger().info(f'{BUTTON_KEYS[i]} {"pressed" if new else "released"}')
+        self._buttons = buttons
+        self._values = values
 
-        if moving:
-            msg = Twist()
-            msg.linear.x  = self._last_vx
-            msg.linear.y  = self._last_vy
-            msg.angular.z = self._last_vyaw
-            self.pub_cmd_vel.publish(msg)
-            self._was_moving = True
-        elif self._was_moving:
-            # one-shot zero on release / timeout
-            self.pub_cmd_vel.publish(Twist())
-            self._was_moving = False
-        # else: idle — do not publish
+    def _publish(self):
+        if self.pub_joy:
+            joy = Joy()
+            joy.header.stamp = self.get_clock().now().to_msg()
+            joy.header.frame_id = self.joy_frame
+            joy.axes = list(self._values)
+            joy.buttons = [int(b) for b in self._buttons]
+            for pub in self.pub_joy:
+                pub.publish(joy)
+        for v, pubs in zip(self._values, self.pub_values):
+            if pubs:
+                msg = Float32(data=v)
+                for pub in pubs:
+                    pub.publish(msg)
 
     def destroy_node(self):
         try:
@@ -177,31 +200,18 @@ class XrButtonBridge(Node):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='XR controller UDP -> ROS 2 bridge')
-    parser.add_argument('--host', type=str, default='0.0.0.0',
-                        help='UDP bind host (0.0.0.0 = any interface)')
-    parser.add_argument('--port', type=int, default=9870, help='UDP bind port')
-    parser.add_argument('--cmd-vel-topic', type=str, default='/cmd_vel',
-                        help='Twist topic name for stick-derived velocity')
-    parser.add_argument('--cmd-vel-rate', type=float, default=50.0,
-                        help='Republish rate for cmd_vel [Hz]')
-    parser.add_argument('--cmd-vel-timeout', type=float, default=0.5,
-                        help='Zero-out cmd_vel after this many seconds without a stick packet')
-    parser.add_argument('--cmd-vel-deadzone', type=float, default=1e-3,
-                        help='Stick magnitude threshold below which cmd_vel is NOT published (m/s or rad/s)')
-    parser.add_argument('--damp-topic', type=str, default='/teleop/damp',
-                        help='Bool topic pulsed when both sticks are pressed')
-    parser.add_argument('--qos-depth', type=int, default=10, help='publisher QoS depth for buttons')
+    parser = argparse.ArgumentParser(description='XR controller (all inputs) UDP -> ROS 2 bridge')
+    parser.add_argument('--config', type=str, default=DEFAULT_CONFIG,
+                        help=f'YAML config file (default: {DEFAULT_CONFIG})')
+    parser.add_argument('--host', type=str, default=None, help='override udp.host in YAML')
+    parser.add_argument('--port', type=int, default=None, help='override udp.port in YAML')
     args, ros_argv = parser.parse_known_args(argv if argv is not None else sys.argv[1:])
 
+    cfg = load_config(args.config)
+
     rclpy.init(args=ros_argv)
-    node = XrButtonBridge(host=args.host, port=args.port,
-                          cmd_vel_topic=args.cmd_vel_topic,
-                          cmd_vel_rate=args.cmd_vel_rate,
-                          cmd_vel_timeout=args.cmd_vel_timeout,
-                          cmd_vel_deadzone=args.cmd_vel_deadzone,
-                          damp_hold_topic=args.damp_topic,
-                          qos_depth=args.qos_depth)
+    node = XrButtonBridge(cfg, host=args.host, port=args.port)
+    node.get_logger().info(f'config: {os.path.abspath(args.config)}')
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -216,3 +226,4 @@ def main(argv=None):
 
 if __name__ == '__main__':
     main()
+

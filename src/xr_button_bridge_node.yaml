@@ -1,0 +1,54 @@
+# xr_button_bridge_node.py configuration
+#
+# Topic assignment:
+#   - a string            -> publish to that topic
+#   - a list of strings   -> publish the same message to every topic in the list
+#   - null / "" / []      -> disabled (not published)
+
+udp:
+  host: 0.0.0.0        # 0.0.0.0 = any interface, 127.0.0.1 = localhost only
+  port: 9870
+
+qos_depth: 10
+publish_hz: 30.0       # rate for joy / values topics
+timeout: 0.5           # [s] no packet for this long -> all inputs released / zeroed
+
+# Trigger is turned into an on/off button from its analog value (0.0 .. 1.0).
+#   ON  when value >= threshold
+#   OFF when value <  threshold - hysteresis
+trigger:
+  threshold: 0.5
+  hysteresis: 0.0      # e.g. 0.05 to suppress chatter around the threshold
+
+# Edge-triggered std_msgs/Bool (True once on press, False once on release)
+buttons:
+  left_trigger:     /xr/left/trigger
+  left_squeeze:     /xr/left/squeeze
+  left_x:           /xr/left/x
+  left_y:           [/xr/left/y, /left_button]     # /left_button kept for backward compatibility
+  left_thumbstick:  /xr/left/thumbstick
+  right_trigger:    /xr/right/trigger
+  right_squeeze:    /xr/right/squeeze
+  right_a:          /xr/right/a
+  right_b:          [/xr/right/b, /right_button]   # /right_button kept for backward compatibility
+  right_thumbstick: /xr/right/thumbstick
+
+# Continuous std_msgs/Float32 at publish_hz
+values:
+  left_trigger:  /xr/left/trigger_value    # 0.0 released .. 1.0 fully pressed
+  left_squeeze:  /xr/left/squeeze_value    # 0.0 .. 1.0
+  left_stick_x:  /xr/left/stick_x
+  left_stick_y:  /xr/left/stick_y
+  right_trigger: /xr/right/trigger_value
+  right_squeeze: /xr/right/squeeze_value
+  right_stick_x: /xr/right/stick_x
+  right_stick_y: /xr/right/stick_y
+
+# Continuous sensor_msgs/Joy at publish_hz
+#   axes    = [L_trigger, L_squeeze, L_stick_x, L_stick_y, R_trigger, R_squeeze, R_stick_x, R_stick_y]
+#   buttons = [L_trigger, L_squeeze, X, Y, L_thumbstick, R_trigger, R_squeeze, A, B, R_thumbstick]
+#   (trigger buttons use the threshold above)
+joy:
+  topic: /xr/joy
+  frame_id: xr_controller
+

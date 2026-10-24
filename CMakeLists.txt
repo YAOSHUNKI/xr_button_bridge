@@ -20,6 +20,15 @@ install(PROGRAMS
   src/arm_state_ros2_publisher.py
   DESTINATION lib/${PROJECT_NAME}
 )
+install(PROGRAMS
+  src/xr_losstime_read.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+install(PROGRAMS
+  src/timed_button_subscriber.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 # (optional) install launch / config directories if you add them later
 # install(DIRECTORY launch config
 #   DESTINATION share/${PROJECT_NAME}
