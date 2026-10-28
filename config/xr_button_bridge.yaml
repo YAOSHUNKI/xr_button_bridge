@@ -26,12 +26,12 @@ buttons:
   left_squeeze:     /xr/left/squeeze
   left_x:           /xr/left/x
   left_y:           [/xr/left/y, /left_button]     # /left_button kept for backward compatibility
-  left_thumbstick:  /xr/left/thumbstick
+  left_thumbstick:  /left_button
   right_trigger:    /xr/right/trigger
   right_squeeze:    /xr/right/squeeze
   right_a:          /xr/right/a
   right_b:          [/xr/right/b, /right_button]   # /right_button kept for backward compatibility
-  right_thumbstick: /xr/right/thumbstick
+  right_thumbstick: /cylinder_butoon
 
 # Continuous std_msgs/Float32 at publish_hz
 values:

@@ -54,7 +54,22 @@ VALUE_KEYS = [
 TRIGGER_MAP = {BUTTON_KEYS.index('left_trigger'):  VALUE_KEYS.index('left_trigger'),
                BUTTON_KEYS.index('right_trigger'): VALUE_KEYS.index('right_trigger')}
 
-DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'xr_button_bridge.yaml')
+PACKAGE_NAME = 'xr_button_bridge'
+CONFIG_NAME = 'xr_button_bridge.yaml'
+
+
+def config_candidates():
+    """Search order when --config is not given."""
+    cands = []
+    try:
+        from ament_index_python.packages import get_package_share_directory
+        share = get_package_share_directory(PACKAGE_NAME)
+        cands += [os.path.join(share, 'config', CONFIG_NAME), os.path.join(share, CONFIG_NAME)]
+    except Exception:
+        pass
+    here = os.path.dirname(os.path.realpath(__file__))
+    cands += [os.path.join(here, CONFIG_NAME), os.path.join(os.getcwd(), CONFIG_NAME)]
+    return cands
 
 
 def _topics(entry):
@@ -201,12 +216,19 @@ class XrButtonBridge(Node):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='XR controller (all inputs) UDP -> ROS 2 bridge')
-    parser.add_argument('--config', type=str, default=DEFAULT_CONFIG,
-                        help=f'YAML config file (default: {DEFAULT_CONFIG})')
+    parser.add_argument('--config', type=str, default=None,
+                        help='YAML config file (default: share/xr_button_bridge/config/'
+                             'xr_button_bridge.yaml, then next to this script, then cwd)')
     parser.add_argument('--host', type=str, default=None, help='override udp.host in YAML')
     parser.add_argument('--port', type=int, default=None, help='override udp.port in YAML')
     args, ros_argv = parser.parse_known_args(argv if argv is not None else sys.argv[1:])
 
+    if args.config is None:
+        tried = config_candidates()
+        args.config = next((c for c in tried if os.path.isfile(c)), None)
+        if args.config is None:
+            sys.exit('xr_button_bridge: config file not found. Tried:\n  ' + '\n  '.join(tried)
+                     + '\nInstall it to share/xr_button_bridge/config/ or pass --config <path>.')
     cfg = load_config(args.config)
 
     rclpy.init(args=ros_argv)
